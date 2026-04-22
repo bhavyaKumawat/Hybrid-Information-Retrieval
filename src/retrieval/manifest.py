@@ -3,11 +3,17 @@
 Two tables, both keyed on deterministic IDs so the manifest can be the
 single source of truth about what lives in Qdrant:
 
-* ``documents`` — one row per document. Tracks the document-level
-  content hash plus the chunker/model fingerprint that produced its
-  current set of chunks.
-* ``chunks``    — one row per chunk. Holds the chunk-level hash and
-  the Qdrant point id, so we can reconcile upserts and deletions.
+* ``documents`` — one row per ``(collection, doc_id)``. Tracks the
+  document-level content hash plus the chunker/model fingerprint that
+  produced its current set of chunks.
+* ``chunks``    — one row per ``(collection, doc_id, chunk_index)``.
+  Holds the chunk-level hash and the Qdrant point id, so we can
+  reconcile upserts and deletions.
+
+``collection`` is part of every primary key so a single shared manifest
+file can track state for many Qdrant collections side-by-side (required
+for the ablation evaluation, which creates one collection per unique
+embedder × chunker pair).
 
 No ORM — this is a tiny, hot-path table.
 """
@@ -23,27 +29,32 @@ from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
-    doc_id               TEXT PRIMARY KEY,
+    collection           TEXT NOT NULL,
+    doc_id               TEXT NOT NULL,
     content_hash         TEXT NOT NULL,
     chunker_config_hash  TEXT NOT NULL,
     dense_model          TEXT NOT NULL,
     sparse_model         TEXT NOT NULL,
     chunk_count          INTEGER NOT NULL,
-    ingested_at          TEXT NOT NULL
+    ingested_at          TEXT NOT NULL,
+    PRIMARY KEY (collection, doc_id)
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
+    collection   TEXT NOT NULL,
     doc_id       TEXT NOT NULL,
     chunk_index  INTEGER NOT NULL,
     chunk_hash   TEXT NOT NULL,
     point_id     TEXT NOT NULL,
     dense_model  TEXT NOT NULL,
     ingested_at  TEXT NOT NULL,
-    PRIMARY KEY (doc_id, chunk_index),
-    FOREIGN KEY (doc_id) REFERENCES documents(doc_id) ON DELETE CASCADE
+    PRIMARY KEY (collection, doc_id, chunk_index),
+    FOREIGN KEY (collection, doc_id)
+        REFERENCES documents(collection, doc_id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(doc_id, chunk_hash);
+CREATE INDEX IF NOT EXISTS idx_chunks_hash
+    ON chunks(collection, doc_id, chunk_hash);
 """
 
 
@@ -69,10 +80,18 @@ class ChunkRecord:
 
 
 class Manifest:
-    """Thread-safe wrapper around a single SQLite file."""
+    """Thread-safe wrapper around a single SQLite file, scoped to one collection.
 
-    def __init__(self, path: Path | str) -> None:
+    Construct one ``Manifest`` per Qdrant collection you want to track; the
+    underlying DB file is shared across collections, the instance just
+    remembers which collection every read/write operation applies to.
+    """
+
+    def __init__(self, path: Path | str, collection: str) -> None:
+        if not collection:
+            raise ValueError("Manifest requires a non-empty collection name")
         self.path = Path(path)
+        self.collection = collection
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         with self._connect() as conn:
@@ -98,7 +117,8 @@ class Manifest:
     def get_document(self, doc_id: str) -> DocumentRecord | None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM documents WHERE doc_id = ?", (doc_id,)
+                "SELECT * FROM documents WHERE collection = ? AND doc_id = ?",
+                (self.collection, doc_id),
             ).fetchone()
         return _doc_from_row(row) if row else None
 
@@ -107,10 +127,10 @@ class Manifest:
             conn.execute(
                 """
                 INSERT INTO documents
-                    (doc_id, content_hash, chunker_config_hash, dense_model,
-                     sparse_model, chunk_count, ingested_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(doc_id) DO UPDATE SET
+                    (collection, doc_id, content_hash, chunker_config_hash,
+                     dense_model, sparse_model, chunk_count, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(collection, doc_id) DO UPDATE SET
                     content_hash        = excluded.content_hash,
                     chunker_config_hash = excluded.chunker_config_hash,
                     dense_model         = excluded.dense_model,
@@ -119,6 +139,7 @@ class Manifest:
                     ingested_at         = excluded.ingested_at
                 """,
                 (
+                    self.collection,
                     record.doc_id,
                     record.content_hash,
                     record.chunker_config_hash,
@@ -131,7 +152,10 @@ class Manifest:
 
     def delete_document(self, doc_id: str) -> None:
         with self._lock, self._connect() as conn:
-            conn.execute("DELETE FROM documents WHERE doc_id = ?", (doc_id,))
+            conn.execute(
+                "DELETE FROM documents WHERE collection = ? AND doc_id = ?",
+                (self.collection, doc_id),
+            )
 
     # ------------------------------------------------------------------
     # Chunks
@@ -140,14 +164,19 @@ class Manifest:
     def get_chunks(self, doc_id: str) -> list[ChunkRecord]:
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM chunks WHERE doc_id = ? ORDER BY chunk_index",
-                (doc_id,),
+                """
+                SELECT * FROM chunks
+                WHERE collection = ? AND doc_id = ?
+                ORDER BY chunk_index
+                """,
+                (self.collection, doc_id),
             ).fetchall()
         return [_chunk_from_row(r) for r in rows]
 
     def upsert_chunks(self, records: Iterable[ChunkRecord]) -> None:
         rows = [
             (
+                self.collection,
                 r.doc_id,
                 r.chunk_index,
                 r.chunk_hash,
@@ -163,9 +192,10 @@ class Manifest:
             conn.executemany(
                 """
                 INSERT INTO chunks
-                    (doc_id, chunk_index, chunk_hash, point_id, dense_model, ingested_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(doc_id, chunk_index) DO UPDATE SET
+                    (collection, doc_id, chunk_index, chunk_hash,
+                     point_id, dense_model, ingested_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(collection, doc_id, chunk_index) DO UPDATE SET
                     chunk_hash  = excluded.chunk_hash,
                     point_id    = excluded.point_id,
                     dense_model = excluded.dense_model,
@@ -178,23 +208,33 @@ class Manifest:
         """Remove chunk rows with ``chunk_index > max_index`` (returns what was removed)."""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM chunks WHERE doc_id = ? AND chunk_index > ?",
-                (doc_id, max_index),
+                """
+                SELECT * FROM chunks
+                WHERE collection = ? AND doc_id = ? AND chunk_index > ?
+                """,
+                (self.collection, doc_id, max_index),
             ).fetchall()
             stale = [_chunk_from_row(r) for r in rows]
             conn.execute(
-                "DELETE FROM chunks WHERE doc_id = ? AND chunk_index > ?",
-                (doc_id, max_index),
+                """
+                DELETE FROM chunks
+                WHERE collection = ? AND doc_id = ? AND chunk_index > ?
+                """,
+                (self.collection, doc_id, max_index),
             )
         return stale
 
     def delete_chunks_for_doc(self, doc_id: str) -> list[ChunkRecord]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM chunks WHERE doc_id = ?", (doc_id,)
+                "SELECT * FROM chunks WHERE collection = ? AND doc_id = ?",
+                (self.collection, doc_id),
             ).fetchall()
             stale = [_chunk_from_row(r) for r in rows]
-            conn.execute("DELETE FROM chunks WHERE doc_id = ?", (doc_id,))
+            conn.execute(
+                "DELETE FROM chunks WHERE collection = ? AND doc_id = ?",
+                (self.collection, doc_id),
+            )
         return stale
 
     # ------------------------------------------------------------------
@@ -203,14 +243,21 @@ class Manifest:
 
     def stats(self) -> dict[str, int]:
         with self._connect() as conn:
-            docs = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-            chunks = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            docs = conn.execute(
+                "SELECT COUNT(*) FROM documents WHERE collection = ?",
+                (self.collection,),
+            ).fetchone()[0]
+            chunks = conn.execute(
+                "SELECT COUNT(*) FROM chunks WHERE collection = ?",
+                (self.collection,),
+            ).fetchone()[0]
         return {"documents": docs, "chunks": chunks}
 
     def reset(self) -> None:
+        """Delete all rows for THIS collection only (other collections untouched)."""
         with self._lock, self._connect() as conn:
-            conn.execute("DELETE FROM chunks")
-            conn.execute("DELETE FROM documents")
+            conn.execute("DELETE FROM chunks WHERE collection = ?", (self.collection,))
+            conn.execute("DELETE FROM documents WHERE collection = ?", (self.collection,))
 
 
 # ----------------------------------------------------------------------

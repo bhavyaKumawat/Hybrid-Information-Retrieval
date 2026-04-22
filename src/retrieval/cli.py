@@ -62,7 +62,7 @@ def ingest(
     _print_run_config(settings)
 
     client = build_client(settings)
-    manifest = Manifest(settings.manifest_path)
+    manifest = Manifest(settings.manifest_path, settings.qdrant_collection)
     chunker = build_chunker(settings)
     dense = DenseEmbedder(settings.dense_model)
     sparse = SparseEmbedder(settings.sparse_model)
@@ -95,7 +95,7 @@ def ingest(
 def stats() -> None:
     """Show manifest + collection stats."""
     settings = get_settings()
-    manifest = Manifest(settings.manifest_path)
+    manifest = Manifest(settings.manifest_path, settings.qdrant_collection)
     client = build_client(settings)
 
     m = manifest.stats()
@@ -123,7 +123,7 @@ def reset(
             raise typer.Exit(code=1)
     client = build_client(settings)
     drop_collection(client, settings)
-    Manifest(settings.manifest_path).reset()
+    Manifest(settings.manifest_path, settings.qdrant_collection).reset()
     console.print("[green]reset complete[/green]")
 
 
