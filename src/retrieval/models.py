@@ -19,7 +19,6 @@ class RawDocument(BaseModel):
     title: str
     text: str
     source: str
-    source_url: str | None = None
     date: datetime | None = None
 
 
@@ -90,7 +89,6 @@ class SearchHit(BaseModel):
     chunk_text: str
     doc_title: str | None = None
     source: str | None = None
-    source_url: str | None = None
     date: datetime | None = None
     scores: ScoreBreakdown
     payload: dict[str, Any] = Field(default_factory=dict)

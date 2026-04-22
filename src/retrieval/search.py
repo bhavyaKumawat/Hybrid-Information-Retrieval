@@ -297,7 +297,6 @@ def _candidate_to_hit(c: _Candidate) -> SearchHit:
         chunk_text=p.get("chunk_text", ""),
         doc_title=p.get("doc_title"),
         source=p.get("source"),
-        source_url=p.get("source_url"),
         date=date_val,
         scores=ScoreBreakdown(
             bm25=c.bm25_score,
@@ -318,7 +317,6 @@ def _candidate_to_hit(c: _Candidate) -> SearchHit:
                 "chunk_total",
                 "doc_id",
                 "doc_title",
-                "source_url",
                 "source",
                 "date",
             }

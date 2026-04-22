@@ -328,7 +328,6 @@ def _build_payload(
         # Source metadata
         "doc_id": doc.doc_id,
         "doc_title": doc.title,
-        "source_url": doc.source_url,
         # Filterable fields
         "source": doc.source,
         "date": doc.date.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")

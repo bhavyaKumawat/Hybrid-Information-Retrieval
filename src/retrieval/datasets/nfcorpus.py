@@ -4,7 +4,6 @@ Pulls the NFCorpus corpus from the BEIR mirror on Hugging Face
 (``BeIR/nfcorpus``, ``corpus`` split). Yields :class:`RawDocument` with:
 
 * ``source`` fixed to ``"pubmed"`` — NFCorpus is PubMed-derived.
-* ``source_url`` from the corpus row's ``url`` field when present.
 * ``date`` — NFCorpus doesn't ship a publication date, so we synthesise a
   deterministic one (seeded from the doc id, spread 2010-01-01 .. 2022-12-31).
   That lets the metadata date-filter be exercised end-to-end; it's *not* a
@@ -55,13 +54,11 @@ def load_nfcorpus(limit: int | None = None) -> Iterator[RawDocument]:
         text = (row.get("text") or "").strip()
         if not doc_id or not text:
             continue
-        url = _extract_url(row)
         yield RawDocument(
             doc_id=doc_id,
             title=title,
             text=text,
             source=SOURCE,
-            source_url=url,
             date=_synthetic_date(doc_id),
         )
         seen += 1
@@ -71,16 +68,3 @@ def _iter_rows(ds) -> Iterable[dict]:
     # ``datasets`` is iterable and yields dict-like rows.
     for row in ds:
         yield dict(row)
-
-
-def _extract_url(row: dict) -> str | None:
-    # Some NFCorpus mirrors store metadata as a JSON-ish dict, others flat.
-    url = row.get("url")
-    if isinstance(url, str) and url:
-        return url
-    meta = row.get("metadata")
-    if isinstance(meta, dict):
-        cand = meta.get("url")
-        if isinstance(cand, str) and cand:
-            return cand
-    return None

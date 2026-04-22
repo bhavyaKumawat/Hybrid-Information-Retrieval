@@ -177,7 +177,6 @@ Exactly what the assignment specifies:
 
   "doc_id": "MED-1234",
   "doc_title": "Effects of ...",
-  "source_url": "http://www.ncbi.nlm.nih.gov/pubmed/25329299",
 
   "source": "pubmed",
   "date": "2018-06-15T00:00:00Z",
@@ -233,7 +232,6 @@ Response (truncated):
       "chunk_text": "...",
       "doc_title": "...",
       "source": "pubmed",
-      "source_url": "http://...",
       "date": "2018-06-15T00:00:00Z",
       "scores": {
         "bm25": 12.34,
